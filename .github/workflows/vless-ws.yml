@@ -1,0 +1,452 @@
+name: Vless WARP Gateway
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: vless-warp-gateway
+  cancel-in-progress: true
+
+env:
+  # ---------- Controller settings ----------
+  CONTROLLER_URL: ${{ secrets.CONTROLLER_URL }}
+  GH_TOKEN: ${{ secrets.GH_TOKEN }}
+  NODE_ID: ${{ github.repository }}
+  RUN_ID: ${{ github.run_id }}
+
+  # ---------- Core version ----------
+  XRAY_VERSION: 26.3.27
+
+  # ---------- WARP config ----------
+  WARP_REG_JSON: ${{ secrets.WARP_REG_JSON }}
+  WARP_CONF_JSON: ${{ secrets.WARP_CONF_JSON }}
+
+  # ---------- Cloudflare Tunnel ----------
+  TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
+
+  # ---------- Optional settings ----------
+  XRAY_SERVER: ${{ secrets.XRAY_SERVER }}
+  XRAY_PORT: ${{ secrets.XRAY_PORT }}
+  WARP_ENDPOINT: ${{ secrets.WARP_ENDPOINT }}
+  WARP_MTU: ${{ secrets.WARP_MTU }}
+  XRAY_RUNTIME: ${{ secrets.XRAY_RUNTIME }}
+  XRAY_CLIENTS: ${{ secrets.XRAY_CLIENTS }}
+  # ---------- VLESS Encryption settings ----------
+  VLESS_DECRYPTION: ${{ secrets.VLESS_DECRYPTION }}
+  VLESS_ENCRYPTION: ${{ secrets.VLESS_ENCRYPTION }}
+
+jobs:
+  gateway:
+    runs-on: ubuntu-latest
+    steps:
+      # ---------- Cache ----------
+      - name: Cache Xray
+        uses: actions/cache@v6
+        with:
+          path: ~/xray
+          key: xray-${{ env.XRAY_VERSION }}-${{ runner.arch }}
+
+      - name: Get latest versions
+        id: versions
+        run: |
+          CF_VERSION=$(curl -fsSL https://api.github.com/repos/cloudflare/cloudflared/releases/latest | jq -r '.tag_name') || CF_VERSION="2026.7.0"
+          CADDY_VERSION=$(curl -fsSL https://api.github.com/repos/caddyserver/caddy/releases/latest | jq -r '.tag_name') || CADDY_VERSION="v2.11.4"
+          CADDY_VERSION=${CADDY_VERSION#v}
+          echo "cloudflared=$CF_VERSION" >> "$GITHUB_OUTPUT"
+          echo "caddy=$CADDY_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Cache cloudflared
+        uses: actions/cache@v6
+        with:
+          path: ~/cloudflared
+          key: cloudflared-${{ steps.versions.outputs.cloudflared }}
+
+      - name: Cache Caddy
+        uses: actions/cache@v6
+        with:
+          path: ~/caddy
+          key: caddy-${{ steps.versions.outputs.caddy }}-${{ runner.arch }}
+
+      # ---------- Xray ----------
+      - name: Install Xray
+        run: |
+          set -Eeuo pipefail
+          mkdir -p ~/xray
+          if [ ! -x ~/xray/xray ]; then
+            wget -q https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-64.zip -O /tmp/xray.zip || wget -q "https://github.com/350001/001/releases/download/bootstrap/Xray-linux-64.zip" -O /tmp/xray.zip
+            unzip -oq /tmp/xray.zip -d ~/xray
+            chmod +x ~/xray/xray
+          fi
+          ~/xray/xray version
+
+      # ---------- WARP registration ----------
+      - name: Install & Register WARP
+        if: env.WARP_REG_JSON == '' || env.WARP_CONF_JSON == ''
+        run: |
+          set -Eeuo pipefail
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloudflare-warp.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          sudo apt update
+          sudo apt install -y cloudflare-warp
+          warp-cli --accept-tos registration new
+          warp-cli --accept-tos tunnel protocol set WireGuard
+          sleep 3
+          mkdir -p ~/warp-config
+          sudo cp /var/lib/cloudflare-warp/{reg.json,conf.json} ~/warp-config/
+          sudo chown -R "$USER:$USER" ~/warp-config
+          echo "✅ WARP registered and config files saved to ~/warp-config/"
+
+      # ---------- Generate Config & Guest Account (VLESS) ----------
+      - name: Generate Config & Guest Account
+        run: |
+          set -Eeuo pipefail
+          GUEST_EMAIL="guest-$(openssl rand -hex 2)"
+          GUEST_UUID="$(~/xray/xray uuid)"
+          GUEST_PATH="/api/$(openssl rand -hex 4)"
+          echo "GUEST_EMAIL=$GUEST_EMAIL" >> $GITHUB_ENV
+          echo "GUEST_UUID=$GUEST_UUID" >> $GITHUB_ENV
+          echo "GUEST_PATH=$GUEST_PATH" >> $GITHUB_ENV
+          mkdir -p ~/xray
+          XRAY_CLIENTS_MERGED=$(
+            jq \
+            --arg id "$GUEST_UUID" \
+            --arg email "$GUEST_EMAIL" \
+            '. + [{
+              id:$id,
+              email:$email
+            }]' \
+            <<< "${XRAY_CLIENTS:-[]}"
+          )
+          echo "${XRAY_CLIENTS_MERGED}" | jq empty >/dev/null 2>&1 || { echo "❌ XRAY_CLIENTS is not valid JSON"; exit 1; }
+          if [ -n "$WARP_REG_JSON" ] && [ -n "$WARP_CONF_JSON" ]; then
+            echo "✅ Using WARP config from Secrets."
+            WARP_PRIVATE_KEY=$(jq -r '.secret_key' <<< "$WARP_REG_JSON")
+            WARP_PUBLIC_KEY=$(jq -r '.public_key' <<< "$WARP_CONF_JSON")
+            WARP_IPV4=$(jq -r '.interface.v4' <<< "$WARP_CONF_JSON")
+            WARP_IPV6=$(jq -r '.interface.v6 // empty' <<< "$WARP_CONF_JSON")
+            WARP_ENDPOINT="${WARP_ENDPOINT:-$(jq -r '.endpoints[0].v4 // "engage.cloudflareclient.com:2408"' <<< "$WARP_CONF_JSON")}"
+          else
+            echo "⚠️ Secrets not set, trying local config."
+            REG_COMPACT=$(jq -c . ~/warp-config/reg.json) || {
+              echo "❌ reg.json not found or invalid"
+              exit 1
+            }
+            CONF_COMPACT=$(jq -c . ~/warp-config/conf.json) || {
+              echo "❌ conf.json not found or invalid"
+              exit 1
+            }
+            WARP_PRIVATE_KEY=$(jq -r '.secret_key' <<< "$REG_COMPACT")
+            WARP_PUBLIC_KEY=$(jq -r '.public_key' <<< "$CONF_COMPACT")
+            WARP_IPV4=$(jq -r '.interface.v4' <<< "$CONF_COMPACT")
+            WARP_IPV6=$(jq -r '.interface.v6 // empty' <<< "$CONF_COMPACT")
+            WARP_ENDPOINT="${WARP_ENDPOINT:-$(jq -r '.endpoints[0].v4' <<< "$CONF_COMPACT")}"
+            if [ -n "$GH_TOKEN" ]; then
+              REPO="${{ github.repository }}"
+              echo "Setting Secrets WARP_REG_JSON and WARP_CONF_JSON for future runs..."
+              gh secret set WARP_REG_JSON \
+                --body "$REG_COMPACT" \
+                -R "$REPO" || echo "⚠️ Failed to set WARP_REG_JSON"
+              gh secret set WARP_CONF_JSON \
+                --body "$CONF_COMPACT" \
+                -R "$REPO" || echo "⚠️ Failed to set WARP_CONF_JSON"
+              echo "✅ Secrets updated."
+            else
+              echo "⚠️ GH_TOKEN not set, secrets not updated."
+            fi
+          fi
+          # ---------- Try to fetch template from Controller (public) ----------
+          TEMPLATE_FILE="/tmp/template.json"
+          if [ -n "$CONTROLLER_URL" ]; then
+            TEMPLATE_URL="${CONTROLLER_URL}/assets/vless-ws-template.json"
+            echo "🌐 Attempting to fetch template from ${TEMPLATE_URL} ..."
+            if curl -fsSL --connect-timeout 5 --max-time 10 \
+                 "$TEMPLATE_URL" -o "$TEMPLATE_FILE" && jq empty "$TEMPLATE_FILE" 2>/dev/null; then
+              echo "✅ Template fetched successfully from Controller."
+            else
+              echo "⚠️ Failed to fetch template from Controller, using default template."
+              cat > "$TEMPLATE_FILE" <<'EOF'
+          {
+            "log": {
+              "access": "none",
+              "error": "none",
+              "loglevel": "none",
+              "dnsLog": false,
+              "maskAddress": "half"
+            },
+            "dns": {
+              "servers": [
+                "1.1.1.1",
+                "1.0.0.1"
+              ]
+            },
+            "inbounds": [
+              {
+                "listen": "127.0.0.1",
+                "port": 25392,
+                "protocol": "vless",
+                "settings": {
+                  "clients": [],
+                  "decryption": ""
+                },
+                "streamSettings": {
+                  "network": "ws",
+                  "security": "none",
+                  "wsSettings": {
+                    "path": ""
+                  }
+                }
+              }
+            ],
+            "outbounds": [
+              {
+                "tag": "warp",
+                "protocol": "wireguard",
+                "settings": {
+                  "mtu": 0,
+                  "secretKey": "",
+                  "address": [],
+                  "workers": 4,
+                  "domainStrategy": "ForceIP",
+                  "peers": [
+                    {
+                      "publicKey": "",
+                      "allowedIPs": [
+                        "0.0.0.0/0",
+                        "::/0"
+                      ],
+                      "endpoint": "",
+                      "keepAlive": 25
+                    }
+                  ],
+                  "noKernelTun": true
+                }
+              },
+              {
+                "tag": "direct",
+                "protocol": "freedom"
+              }
+            ]
+          }
+          EOF
+            fi
+          fi
+          jq \
+            --argjson clients "$XRAY_CLIENTS_MERGED" \
+            --arg wspath "$GUEST_PATH" \
+            --arg privateKey "$WARP_PRIVATE_KEY" \
+            --arg publicKey "$WARP_PUBLIC_KEY" \
+            --arg ipv4 "$WARP_IPV4" \
+            --arg ipv6 "$WARP_IPV6" \
+            --arg endpoint "$WARP_ENDPOINT" \
+            --argjson mtu "${WARP_MTU:-1280}" \
+            --arg decryption "${VLESS_DECRYPTION:-none}" \
+            '
+            .inbounds[0].settings.clients = $clients |
+            .inbounds[0].settings.decryption = $decryption |
+            .inbounds[0].streamSettings.wsSettings.path = $wspath |
+            .outbounds[0].settings.secretKey = $privateKey |
+            .outbounds[0].settings.peers[0].publicKey = $publicKey |
+            .outbounds[0].settings.address = ([($ipv4 + "/32")] + (if $ipv6 != "" then [($ipv6 + "/128")] else [] end)) |
+            .outbounds[0].settings.peers[0].endpoint = $endpoint |
+            .outbounds[0].settings.mtu = $mtu
+            ' "$TEMPLATE_FILE" > ~/config.json
+          echo "✅ Xray config generated at ~/config.json"
+
+      # ---------- Xray Test & Start ----------
+      - name: Test & Start Xray
+        run: |
+          set -Eeuo pipefail
+          ~/xray/xray run -test -config ~/config.json
+          nohup ~/xray/xray run -config ~/config.json > ~/xray.log 2>&1 &
+          echo "✅ Xray started"
+
+      # ---------- Caddy ----------
+      - name: Install & Start Caddy
+        run: |
+          set -Eeuo pipefail
+          mkdir -p ~/caddy
+          if [ ! -x ~/caddy/caddy ]; then
+            VERSION="${{ steps.versions.outputs.caddy }}"
+            wget -q "https://github.com/caddyserver/caddy/releases/download/v${VERSION}/caddy_${VERSION}_linux_amd64.tar.gz" -O /tmp/caddy.tar.gz || wget -q "https://github.com/350001/001/releases/download/bootstrap/caddy_2.11.4_linux_amd64.tar.gz" -O /tmp/caddy.tar.gz
+            tar -xzf /tmp/caddy.tar.gz -C ~/caddy caddy
+            chmod +x ~/caddy/caddy
+          fi
+          ~/caddy/caddy version
+          mkdir -p ~/www/api
+          cat > ~/Caddyfile <<EOF
+          :8080
+          handle /api/gateway.json {
+            root * ${HOME}/www
+            header Cache-Control "no-store, no-cache, must-revalidate, max-age=0"
+            header Pragma "no-cache"
+            header Expires "0"
+            file_server
+          }
+          handle /api/helloworld* {
+            rewrite * ${GUEST_PATH}
+            reverse_proxy 127.0.0.1:25392
+          }
+          handle ${GUEST_PATH}* {
+            reverse_proxy 127.0.0.1:25392
+          }
+          handle {
+            root * ${HOME}/www
+            file_server
+          }
+          EOF
+          nohup ~/caddy/caddy run \
+            --config ~/Caddyfile \
+            > ~/caddy.log 2>&1 &
+          echo "✅ Caddy started"
+
+      # ---------- Cloudflare Tunnel ----------
+      - name: Install & Start Cloudflare Tunnel
+        run: |
+          set -Eeuo pipefail
+          mkdir -p ~/cloudflared
+          if [ ! -x ~/cloudflared/cloudflared ]; then
+            VERSION="${{ steps.versions.outputs.cloudflared }}"
+            wget -q https://github.com/cloudflare/cloudflared/releases/download/${VERSION}/cloudflared-linux-amd64 -O ~/cloudflared/cloudflared || wget -q "https://github.com/350001/001/releases/download/bootstrap/cloudflared-linux-amd64" -O ~/cloudflared/cloudflared
+            chmod +x ~/cloudflared/cloudflared
+          fi
+          ~/cloudflared/cloudflared --version
+          test -n "$TUNNEL_TOKEN"
+          sudo sysctl -w net.core.rmem_max=16777216
+          sudo sysctl -w net.core.wmem_max=16777216
+          nohup ~/cloudflared/cloudflared tunnel --metrics 127.0.0.1:60123 run > ~/cloudflared.log 2>&1 &
+          echo "✅ Cloudflare Tunnel started"
+
+      # ---------- Run monitor (VLESS link with dynamic port and encryption) ----------
+      - name: Running Monitor
+        run: |
+          XRAY_RUNTIME="${XRAY_RUNTIME:-300}"
+          echo "======================================"
+          echo "Xray + WARP + Caddy + Cloudflare Ready"
+          echo "======================================"
+          echo
+          if [[ -z "${XRAY_SERVER}" ]]; then
+            PORT=443
+          else
+            if [[ "${XRAY_PORT}" =~ ^[0-9]+$ ]]; then
+              PORT="${XRAY_PORT}"
+            else
+              PORT=80
+            fi
+          fi
+          # ---------- Now handle XRAY_SERVER acquisition ----------
+          if [[ -z "${XRAY_SERVER}" ]]; then
+            coproc CF {
+              ~/cloudflared/cloudflared tunnel --url http://127.0.0.1:8080 2>&1
+            }
+            deadline=$((SECONDS + 30))
+            while (( SECONDS < deadline )); do
+              if IFS= read -r -t 1 -u "${CF[0]}" line; then
+                if [[ "$line" =~ https://[a-zA-Z0-9.-]+\.trycloudflare\.com ]]; then
+                  XRAY_SERVER="${BASH_REMATCH[0]#https://}"
+                  break
+                fi
+              fi
+            done
+            if [[ -z "${XRAY_SERVER}" ]]; then
+              kill "$CF_PID" 2>/dev/null || true
+            fi
+          fi
+          XRAY_SERVER="${XRAY_SERVER:-trycloudflare.com}"
+          # ---------- VLESS link generation ----------
+          # Use VLESS_ENCRYPTION if set, else fallback to "none"
+          ENCRYPTION_VALUE="${VLESS_ENCRYPTION:-none}"
+          VLESS_LINK="vless://${GUEST_UUID}@${XRAY_SERVER}:${PORT}?encryption=${ENCRYPTION_VALUE}&security=none&type=ws&path=${GUEST_PATH}&host=${XRAY_SERVER}#${GUEST_EMAIL}"
+          LINK_BASE64=$(printf '%s' "$VLESS_LINK" | base64 -w 0)
+          EXPIRE_TIMESTAMP=$(( $(date +%s) + ${XRAY_RUNTIME} ))
+          jq -n \
+            --arg user "$GUEST_EMAIL" \
+            --arg uuid "$GUEST_UUID" \
+            --arg path "$GUEST_PATH" \
+            --arg link "$LINK_BASE64" \
+            --argjson expire "$EXPIRE_TIMESTAMP" \
+            --arg node "${{ env.NODE_ID }}" \
+            '{
+              user: $user,
+              uuid: $uuid,
+              path: $path,
+              link: $link,
+              expire_timestamp: $expire,
+              node: $node
+            }' > ~/www/api/gateway.json
+          echo "✅ VLESS link generated"
+          echo "⏳ Waiting for services to be ready (max 120s)..."
+          TOTAL_WAIT=120
+          CHECK_INTERVAL=2
+          ELAPSED=0
+          wait_for() {
+            local description="$1"
+            local cmd="$2"
+            local start_time=$SECONDS
+            while ! eval "$cmd" 2>/dev/null; do
+              if (( SECONDS - start_time >= TOTAL_WAIT )); then
+                echo "⚠️ $description not ready within total timeout, continuing anyway"
+                return 1
+              fi
+              sleep $CHECK_INTERVAL
+            done
+            echo "✅ $description ready"
+            return 0
+          }
+          wait_for "Xray" "nc -z 127.0.0.1 25392"
+          wait_for "Caddy" "curl -s -f -m 2 http://127.0.0.1:8080/api/gateway.json >/dev/null"
+          if [ -n "$TUNNEL_TOKEN" ]; then
+            wait_for "Cloudflare Tunnel" "curl -s --max-time 2 http://127.0.0.1:60123/metrics | grep -q '^cloudflared_tunnel_ha_connections [1-9]'"
+          fi
+          echo "✅ Services ready (or timeout exceeded), proceeding..."
+          if [ -n "${CONTROLLER_URL}" ] && [ -n "${GH_TOKEN}" ]; then
+            echo "🔔 Notifying controller: node ${NODE_ID} is online (run ${RUN_ID})..."
+            curl -X POST "${CONTROLLER_URL}/node/online" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"node\": \"${NODE_ID}\", \"run_id\": \"${RUN_ID}\"}" \
+              || echo "⚠️ Failed to notify controller online (ignored)"
+          fi
+          # ---------- Heartbeat with top and process list ----------
+          HEARTBEAT_LOG=~/gateway-heartbeat.log
+          touch "$HEARTBEAT_LOG"
+          (
+            while true; do
+              {
+                echo
+                echo "===== $(date -u +"%Y-%m-%dT%H:%M:%SZ") ====="
+                top -bn1 -o TIME+ 2>/dev/null | head -n 17
+                echo
+                echo "----- Gateway Processes -----"
+                ps -eo pid,comm,%cpu,%mem,etime,time,rss --sort=-time | \
+                  awk 'NR==1 || /xray|caddy|cloudflared/'
+                echo
+              } >> "$HEARTBEAT_LOG"
+              sleep 60
+            done
+          ) &
+          HEARTBEAT_PID=$!
+          echo
+          echo "===== LIVE HEARTBEAT (${XRAY_RUNTIME}s) ====="
+          timeout ${XRAY_RUNTIME}s tail -F "$HEARTBEAT_LOG" || {
+            EXIT=$?
+            if [ "$EXIT" -ne 124 ]; then
+              kill "$HEARTBEAT_PID" 2>/dev/null || true
+              exit "$EXIT"
+            fi
+          }
+          kill "$HEARTBEAT_PID" 2>/dev/null || true
+          echo
+          echo "================================"
+          echo "Test finished."
+          echo "================================"
+          # ---------- Notify controller: task done ----------
+          echo "🔔 Notifying controller: node ${NODE_ID} task done, trigger next node..."
+          curl -X POST "${CONTROLLER_URL}/task/done" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"node\": \"${NODE_ID}\"}" \
+            || echo "⚠️ Failed to notify controller (ignored)"
+          # ---------- Keep alive: wait for cancel ----------
+          echo "⏳ Node ${NODE_ID} waiting for new node to take over..."
+          timeout 3600s tail -f /dev/null || true
+          echo "⏰ Timeout or exit signal received, exiting..."
